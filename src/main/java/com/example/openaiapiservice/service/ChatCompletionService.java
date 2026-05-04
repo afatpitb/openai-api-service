@@ -7,12 +7,17 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.time.Instant;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Optional;
-import java.util.UUID;
+import java.util.*;
 
 @Service
 
@@ -39,6 +44,78 @@ public class ChatCompletionService {
             ChatCompletion completion = (ChatCompletion) optional.get();
             completion.setResponseJson(responseJson);
             repository.save(completion);
+        }
+    }
+    public void streamOpenAI(ChatRequestDTO requestDTO, SseEmitter emitter) {
+        try {
+            if (apiKey == null || apiKey.isEmpty()) {
+                // fallback mock
+                String content = buildMockAssistantContent(requestDTO);
+                for (char c : content.toCharArray()) {
+                    emitter.send(SseEmitter.event().data(
+                            Map.of("choices", List.of(
+                                    Map.of("delta", Map.of("content", String.valueOf(c)))
+                            ))
+                    ));
+                    Thread.sleep(30);
+                }
+                emitter.send(SseEmitter.event().data("[DONE]"));
+                emitter.complete();
+                return;
+            }
+
+            Map<String, Object> requestMap = new HashMap<>();
+            requestMap.put("model", requestDTO.getModel());
+            requestMap.put("stream", true);
+
+            List<Map<String, String>> messages = new ArrayList<>();
+            for (ChatRequestDTO.Message msg : requestDTO.getMessages()) {
+                messages.add(Map.of(
+                        "role", msg.getRole(),
+                        "content", msg.getContent()
+                ));
+            }
+
+            requestMap.put("messages", messages);
+
+            String body = objectMapper.writeValueAsString(requestMap);
+
+            HttpRequest httpRequest = HttpRequest.newBuilder()
+                    .uri(URI.create("https://api.openai.com/v1/chat/completions"))
+                    .header("Authorization", "Bearer " + apiKey)
+                    .header("Content-Type", "application/json")
+                    .header("Accept", "text/event-stream")
+                    .POST(HttpRequest.BodyPublishers.ofString(body))
+                    .build();
+
+            HttpClient client = HttpClient.newHttpClient();
+
+            HttpResponse<InputStream> response =
+                    client.send(httpRequest, HttpResponse.BodyHandlers.ofInputStream());
+
+            BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(response.body())
+            );
+
+            String line;
+
+            while ((line = reader.readLine()) != null) {
+                if (line.startsWith("data: ")) {
+                    String data = line.substring(6);
+
+                    if ("[DONE]".equals(data)) {
+                        emitter.send(SseEmitter.event().data("[DONE]"));
+                        break;
+                    }
+
+                    emitter.send(SseEmitter.event().data(data));
+                }
+            }
+
+            emitter.complete();
+
+        } catch (Exception e) {
+            emitter.completeWithError(e);
         }
     }
 
@@ -74,66 +151,110 @@ public class ChatCompletionService {
         }
         return "Echo: model=" + requestDTO.getModel() + ", temperature=" + requestDTO.getTemperature() + ", messages=" + count + ", last_user_message=" + lastUser + "";
     }
+    public String buildNonStreamResponseJson(ChatCompletion completion, String content) throws Exception {
+        Map<String, Object> response = new HashMap<>();
 
-    public String buildNonStreamResponseJson(ChatCompletion completion, String assistantContent) throws JsonProcessingException {
-        Map<String, Object> root = new HashMap<>();
-        root.put("id", completion.getId());
-        root.put("object", "chat.completion");
-        root.put("created", completion.getCreated().getEpochSecond());
-        root.put("model", completion.getModel());
+        response.put("id", completion.getId());
+        response.put("object", "chat.completion");
+        response.put("created", System.currentTimeMillis() / 1000);
+        response.put("model", "gpt-4o-mini-2024-07-18");
+
         Map<String, Object> message = new HashMap<>();
         message.put("role", "assistant");
-        message.put("content", assistantContent);
+        message.put("content", content);
+
         Map<String, Object> choice = new HashMap<>();
         choice.put("index", 0);
         choice.put("message", message);
         choice.put("finish_reason", "stop");
-        root.put("choices", java.util.List.of(choice));
-        return objectMapper.writeValueAsString(root);
+
+        response.put("choices", List.of(choice));
+
+        return objectMapper.writeValueAsString(response);
     }
-    @Value("${openai.api.key}")
+    private String buildMockResponse(ChatRequestDTO requestDTO) throws Exception {
+        String content = "Echo: ";
+
+        if (requestDTO.getMessages() != null && !requestDTO.getMessages().isEmpty()) {
+            content += requestDTO.getMessages()
+                    .get(requestDTO.getMessages().size() - 1)
+                    .getContent();
+        }
+
+        Map<String, Object> response = new HashMap<>();
+        response.put("id", "chatcmpl-mock");
+        response.put("object", "chat.completion");
+        response.put("created", System.currentTimeMillis() / 1000);
+        response.put("model", "mock-echo-001");
+
+        Map<String, Object> message = new HashMap<>();
+        message.put("role", "assistant");
+        message.put("content", content);
+
+        Map<String, Object> choice = new HashMap<>();
+        choice.put("index", 0);
+        choice.put("message", message);
+        choice.put("finish_reason", "stop");
+
+        response.put("choices", List.of(choice));
+
+        return objectMapper.writeValueAsString(response);
+    }
+
+
+    @Value("${openai.api.key:}")
     private String apiKey;
 
     public String callOpenAI(ChatRequestDTO requestDTO) throws Exception {
 
-        // 1. 构造 OpenAI 请求参数
-        Map<String, Object> requestMap = new HashMap<>();
-
-        requestMap.put("model", "gpt-4o-mini");
-
-        java.util.List<Map<String, String>> messages = new java.util.ArrayList<>();
-
-        Map<String, String> userMsg = new HashMap<>();
-        userMsg.put("role", "user");
-        String userContent = "";
-
-        if (requestDTO.getMessages() != null && !requestDTO.getMessages().isEmpty()) {
-            userContent = requestDTO.getMessages().get(0).getContent();
+        // 👉 1. 如果没有 API key，直接 mock
+        if (apiKey == null || apiKey.isEmpty()) {
+            return buildMockResponse(requestDTO);
         }
 
-        userMsg.put("content", userContent);
+        try {
+            // 👉 2. 构造请求
+            Map<String, Object> requestMap = new HashMap<>();
+            requestMap.put("model", requestDTO.getModel());
 
-        messages.add(userMsg);
+            List<Map<String, String>> messages = new ArrayList<>();
 
-        requestMap.put("messages", messages);
+            // ✅ 修复：遍历所有 messages（不是只取第一条）
+            if (requestDTO.getMessages() != null) {
+                for (ChatRequestDTO.Message msg : requestDTO.getMessages()) {
+                    Map<String, String> m = new HashMap<>();
+                    m.put("role", msg.getRole());
+                    m.put("content", msg.getContent());
+                    messages.add(m);
+                }
+            }
 
-        // 2. 转 JSON
-        String requestBody = objectMapper.writeValueAsString(requestMap);
+            requestMap.put("messages", messages);
 
-        // 3. 发送 HTTP 请求
-        java.net.http.HttpClient client = java.net.http.HttpClient.newHttpClient();
+            String requestBody = objectMapper.writeValueAsString(requestMap);
 
-        java.net.http.HttpRequest request = java.net.http.HttpRequest.newBuilder()
-                .uri(new java.net.URI("https://api.openai.com/v1/chat/completions"))
-                .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + apiKey)
-                .POST(java.net.http.HttpRequest.BodyPublishers.ofString(requestBody))
-                .build();
+            // 👉 3. 调用 OpenAI
+            HttpRequest httpRequest = HttpRequest.newBuilder()
+                    .uri(URI.create("https://api.openai.com/v1/chat/completions"))
+                    .header("Authorization", "Bearer " + apiKey)
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                    .build();
 
-        java.net.http.HttpResponse<String> response =
-                client.send(request, java.net.http.HttpResponse.BodyHandlers.ofString());
+            HttpClient client = HttpClient.newHttpClient();
+            HttpResponse<String> response = client.send(httpRequest, HttpResponse.BodyHandlers.ofString());
 
-        return response.body();
+            // 👉 4. 如果失败 → fallback
+            if (response.statusCode() != 200) {
+                return buildMockResponse(requestDTO);
+            }
+
+            return response.body();
+
+        } catch (Exception e) {
+            // 👉 5. 异常 → fallback
+            return buildMockResponse(requestDTO);
+        }
     }
 
     private String generateCompletionId() {
